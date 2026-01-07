@@ -685,14 +685,94 @@ Have fun exploring! 🚀
 `);
 
 // ===================== GitHub Dashboard =====================
+// Cache management with TTL
+const GITHUB_CACHE = {
+  TTL: 10 * 60 * 1000, // 10 minutes
+  prefix: 'xaytheon:gh:',
+  
+  set(key, data) {
+    try {
+      const entry = {
+        data,
+        timestamp: Date.now()
+      };
+      localStorage.setItem(this.prefix + key, JSON.stringify(entry));
+    } catch (e) {
+      console.warn('Cache set failed:', e);
+    }
+  },
+  
+  get(key) {
+    try {
+      const item = localStorage.getItem(this.prefix + key);
+      if (!item) return null;
+      
+      const entry = JSON.parse(item);
+      const age = Date.now() - entry.timestamp;
+      
+      if (age > this.TTL) {
+        this.remove(key);
+        return null;
+      }
+      
+      return entry.data;
+    } catch (e) {
+      console.warn('Cache get failed:', e);
+      return null;
+    }
+  },
+  
+  remove(key) {
+    try {
+      localStorage.removeItem(this.prefix + key);
+    } catch (e) {
+      console.warn('Cache remove failed:', e);
+    }
+  },
+  
+  clear() {
+    try {
+      const keys = Object.keys(localStorage).filter(k => k.startsWith(this.prefix));
+      keys.forEach(k => localStorage.removeItem(k));
+    } catch (e) {
+      console.warn('Cache clear failed:', e);
+    }
+  }
+};
+
+// Debounce helper
+function debounce(func, delay) {
+  let timeoutId;
+  return function(...args) {
+    clearTimeout(timeoutId);
+    timeoutId = setTimeout(() => func.apply(this, args), delay);
+  };
+}
+
+// API call tracker for rate limiting
+const API_TRACKER = {
+  lastCall: 0,
+  minInterval: 1000, // 1 second between calls
+  
+  canCall() {
+    const now = Date.now();
+    return (now - this.lastCall) >= this.minInterval;
+  },
+  
+  recordCall() {
+    this.lastCall = Date.now();
+  }
+};
+
 function initGithubDashboard() {
   const form = document.getElementById("github-form");
   if (!form) return; // section not present
 
-
   const usernameInput = document.getElementById("gh-username");
   const clearBtn = document.getElementById("gh-clear");
   const status = document.getElementById("github-status");
+  let isLoading = false;
+  
   usernameInput.addEventListener('input', () => {
     setStatus('');
   });
@@ -717,14 +797,31 @@ function initGithubDashboard() {
       setStatus("Please enter a GitHub username.", "error");
       return;
     }
+    
+    // Prevent multiple simultaneous requests
+    if (isLoading) {
+      setStatus("Please wait, loading in progress...", "error");
+      return;
+    }
+    
+    // Rate limiting check
+    if (!API_TRACKER.canCall()) {
+      setStatus("Please wait a moment before making another request.", "error");
+      return;
+    }
+    
     // Save only username
     localStorage.setItem("xaytheon:ghCreds", JSON.stringify({ username }));
-    loadGithubDashboard(username);
+    loadGithubDashboard(username).finally(() => {
+      isLoading = false;
+    });
   });
 
   clearBtn.addEventListener("click", () => {
     // Remove saved username
     localStorage.removeItem("xaytheon:ghCreds");
+    // Clear cache
+    GITHUB_CACHE.clear();
     // Clear input field
     const usernameInput = document.getElementById("gh-username");
     if (usernameInput) usernameInput.value = "";
@@ -789,8 +886,32 @@ async function loadGithubDashboard(username) {
       status.style.color = level === "error" ? "#b91c1c" : "#111827";
     }
   };
+  
+  // Disable submit button during load
+  const submitBtn = document.querySelector('#github-form button[type="submit"]');
+  if (submitBtn) {
+    submitBtn.disabled = true;
+    submitBtn.textContent = 'Loading...';
+  }
+
+  // Check cache first
+  const cacheKey = `dashboard:${username}`;
+  const cached = GITHUB_CACHE.get(cacheKey);
+  
+  if (cached) {
+    statusMsg("Loading from cache (fetching fresh data in background)...");
+    renderDashboardData(cached, username);
+    // Fetch fresh data in background
+    fetchAndCacheDashboard(username).catch(console.error);
+    if (submitBtn) {
+      submitBtn.disabled = false;
+      submitBtn.textContent = 'Load Dashboard';
+    }
+    return;
+  }
 
   try {
+    API_TRACKER.recordCall();
     statusMsg("Loading profile…");
     // Profile
     const user = await ghJson(
@@ -864,10 +985,139 @@ async function loadGithubDashboard(username) {
       };
     }
 
+    // Cache the data
+    const dashboardData = {
+      user,
+      repos: top,
+      events: events.slice(0, 10),
+      fetchedAt: Date.now()
+    };
+    GITHUB_CACHE.set(cacheKey, dashboardData);
+
     statusMsg("Done");
   } catch (e) {
     console.error(e);
     statusMsg(e.message || "Failed to load GitHub data", "error");
+  } finally {
+    // Re-enable submit button
+    if (submitBtn) {
+      submitBtn.disabled = false;
+      submitBtn.textContent = 'Load Dashboard';
+    }
+  }
+}
+
+// Helper function to fetch and cache dashboard data
+async function fetchAndCacheDashboard(username) {
+  const headers = {};
+  const cacheKey = `dashboard:${username}`;
+  
+  try {
+    const user = await ghJson(
+      `https://api.github.com/users/${encodeURIComponent(username)}`,
+      headers
+    );
+    
+    const repos = await ghJson(
+      `https://api.github.com/users/${encodeURIComponent(
+        username
+      )}/repos?per_page=100&sort=updated`,
+      headers
+    );
+    
+    const top = [...repos]
+      .filter((r) => !r.fork)
+      .sort((a, b) => (b.stargazers_count || 0) - (a.stargazers_count || 0))
+      .slice(0, 8);
+    
+    const events = await ghJson(
+      `https://api.github.com/users/${encodeURIComponent(
+        username
+      )}/events/public?per_page=25`,
+      headers
+    );
+    
+    const dashboardData = {
+      user,
+      repos: top,
+      events: events.slice(0, 10),
+      fetchedAt: Date.now()
+    };
+    
+    GITHUB_CACHE.set(cacheKey, dashboardData);
+    renderDashboardData(dashboardData, username);
+    
+    const status = document.getElementById("github-status");
+    if (status) {
+      status.textContent = "Updated with fresh data";
+      status.style.color = "#059669";
+    }
+  } catch (e) {
+    console.warn("Background fetch failed:", e);
+  }
+}
+
+// Helper function to render cached dashboard data
+function renderDashboardData(data, username) {
+  const set = (id, val) => {
+    const el = document.getElementById(id);
+    if (el) el.textContent = val;
+  };
+  const avatar = document.getElementById("gh-avatar");
+  
+  // Render user profile
+  if (avatar) avatar.src = data.user.avatar_url;
+  set("gh-name", data.user.name || "—");
+  set("gh-login", `@${data.user.login}`);
+  set("gh-bio", data.user.bio || "");
+  set("gh-followers", data.user.followers ?? 0);
+  set("gh-following", data.user.following ?? 0);
+  set("gh-repos-count", (data.user.public_repos ?? data.repos.length) + "");
+  
+  // Render repos
+  renderRepos(data.repos);
+  
+  // Render activity
+  renderActivity(data.events);
+  
+  // Render contributions chart
+  const setDisplay = (id, disp) => {
+    const el = document.getElementById(id);
+    if (el) el.style.display = disp;
+  };
+  const contribNote = document.getElementById("gh-contrib-note");
+  const container = document.getElementById("gh-contrib-svg");
+  
+  if (contribNote)
+    contribNote.textContent =
+      "Full-year chart via third-party (ghchart.rshah.org). If it fails, we will show an approximate heatmap.";
+  setDisplay("gh-contrib-note", "block");
+  
+  if (container) {
+    container.innerHTML = '<div class="muted">Loading public contributions…</div>';
+    const img = new Image();
+    img.src = `https://ghchart.rshah.org/${encodeURIComponent(username)}`;
+    img.alt = `${username}'s contributions (third-party chart)`;
+    img.style.maxWidth = "100%";
+    img.style.height = "auto";
+    img.referrerPolicy = "no-referrer";
+    img.onload = () => {
+      container.innerHTML = "";
+      container.appendChild(img);
+    };
+    img.onerror = () => {
+      try {
+        const svg = renderEventHeatmap(data.events);
+        container.innerHTML = svg;
+        if (contribNote)
+          contribNote.textContent =
+            "Approximate heatmap based on recent public activity.";
+      } catch (e) {
+        console.warn("Event heatmap failed", e);
+        container.innerHTML =
+          '<div class="muted">No activity found to render a heatmap.</div>';
+      }
+    };
   }
 }
 
@@ -879,6 +1129,19 @@ async function ghJson(url, headers = {}) {
       ...headers,
     },
   });
+  
+  // Check for rate limiting
+  if (res.status === 403 || res.status === 429) {
+    const resetTime = res.headers.get('X-RateLimit-Reset');
+    const remaining = res.headers.get('X-RateLimit-Remaining');
+    
+    if (remaining === '0' || res.status === 429) {
+      const resetDate = resetTime ? new Date(parseInt(resetTime) * 1000) : null;
+      const waitTime = resetDate ? Math.ceil((resetDate - Date.now()) / 60000) : 'unknown';
+      throw new Error(`⚠️ GitHub API rate limit exceeded. Please try again in ${waitTime} minutes.`);
+    }
+  }
+  
   if (!res.ok) {
     const text = await res.text();
     throw new Error(`GitHub API ${res.status}: ${text}`);
